@@ -17,17 +17,47 @@ const API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 // state[chatId] = { step: "awaiting_amount" | "awaiting_receipt", order: {...} }
 const state = {};
 
+// Tracks the message_id of the current "screen" per chat, so we can replace it
+// instead of stacking a new message every time.
+const lastScreenMessageId = {};
+
 // ---------- Telegram API helpers ----------
 
-// replyMarkup: pass a full reply_markup object, e.g. inlineKb(rows) or persistentKeyboard
 async function sendMessage(chatId, text, replyMarkup) {
   const body = { chat_id: chatId, text };
   if (replyMarkup) body.reply_markup = replyMarkup;
-  await fetch(`${API}/sendMessage`, {
+  const res = await fetch(`${API}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body)
   });
+  return res.json();
+}
+
+async function editMessageText(chatId, messageId, text, keyboard) {
+  const res = await fetch(`${API}/editMessageText`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      reply_markup: keyboard || { inline_keyboard: [] }
+    })
+  });
+  return res.json();
+}
+
+async function deleteMessage(chatId, messageId) {
+  try {
+    await fetch(`${API}/deleteMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, message_id: messageId })
+    });
+  } catch (e) {
+    // ignore - message may already be gone or too old to delete
+  }
 }
 
 function inlineKb(rows) {
@@ -39,6 +69,26 @@ const persistentKeyboard = {
   resize_keyboard: true,
   is_persistent: true
 };
+
+// Shows a "screen" to the user: edits the previous screen message if this came
+// from a button click (cq), otherwise deletes the old screen message and sends
+// a fresh one (used when the user replies with free text, e.g. an amount or receipt).
+async function showScreen(chatId, text, keyboard, cq) {
+  if (cq) {
+    const result = await editMessageText(chatId, cq.message.message_id, text, keyboard);
+    if (result.ok) {
+      lastScreenMessageId[chatId] = cq.message.message_id;
+      return;
+    }
+    // fall through to send-new if edit failed (e.g. message too old)
+  } else {
+    const oldId = lastScreenMessageId[chatId];
+    if (oldId) await deleteMessage(chatId, oldId);
+  }
+
+  const sent = await sendMessage(chatId, text, keyboard);
+  if (sent.ok) lastScreenMessageId[chatId] = sent.result.message_id;
+}
 
 async function forwardToAdmin(chatId, text, orderId, withApproval) {
   if (!ADMIN_CHAT_ID) return;
@@ -113,13 +163,14 @@ function insufficientBalanceKeyboard() {
 
 // ---------- Order flow helpers ----------
 
-async function handlePurchase(chatId, product) {
+async function handlePurchase(chatId, product, cq) {
   const user = getUser(chatId);
   if (user.balance < product.price) {
-    await sendMessage(
+    await showScreen(
       chatId,
       `موجودی شما کافی نیست 😔\nموجودی فعلی: ${user.balance.toLocaleString("fa-IR")} تومان\nقیمت ${product.desc}: ${product.price.toLocaleString("fa-IR")} تومان\n\nلطفاً ابتدا موجودی خودتون رو افزایش بدید.`,
-      insufficientBalanceKeyboard()
+      insufficientBalanceKeyboard(),
+      cq
     );
     return;
   }
@@ -132,7 +183,7 @@ async function handlePurchase(chatId, product) {
     status: "در حال انجام"
   });
 
-  await sendMessage(chatId, "✅ درخواست شما ثبت شد و خریدتون در اسرع وقت انجام میشه ♥️");
+  await showScreen(chatId, "✅ درخواست شما ثبت شد و خریدتون در اسرع وقت انجام میشه ♥️", mainMenuKeyboard, cq);
   await forwardToAdmin(
     chatId,
     `🛒 خرید جدید (از موجودی): ${product.desc} — ${product.price.toLocaleString("fa-IR")} تومان\nشناسه سفارش: ${order.id}`,
@@ -159,14 +210,19 @@ async function finalizeTopup(chatId, receiptText, receiptFileId) {
     await forwardToAdmin(chatId, `${summary}\n\nرسید: ${receiptText}`, order.id, true);
   }
 
-  await sendMessage(chatId, "رسید شما دریافت شد و برای بررسی ارسال گردید. لطفاً منتظر تایید ادمین بمانید ♥️");
+  await showScreen(
+    chatId,
+    "رسید شما دریافت شد و برای بررسی ارسال گردید. لطفاً منتظر تایید ادمین بمانید ♥️",
+    mainMenuKeyboard,
+    null // came from a text message, not a button click
+  );
   delete state[chatId];
   return true;
 }
 
-async function showMainMenu(chatId) {
+async function showMainMenu(chatId, cq) {
   delete state[chatId];
-  await sendMessage(chatId, "منوی اصلی:", mainMenuKeyboard);
+  await showScreen(chatId, "منوی اصلی:", mainMenuKeyboard, cq);
 }
 
 // ---------- Webhook ----------
@@ -182,12 +238,12 @@ app.post("/telegram-webhook", async (req, res) => {
       await answerCallback(cq.id);
 
       if (data === "menu_back") {
-        await showMainMenu(chatId);
+        await showMainMenu(chatId, cq);
       } else if (data === "menu_deposit") {
         state[chatId] = { step: "awaiting_amount", order: { type: "topup" } };
-        await sendMessage(chatId, "برای افزایش موجودی مبلغ مورد نیازتون رو ارسال کنید.");
+        await showScreen(chatId, "برای افزایش موجودی مبلغ مورد نیازتون رو ارسال کنید.", undefined, cq);
       } else if (data === "menu_services") {
-        await sendMessage(chatId, "یکی از خدمات زیر رو انتخاب کنید:", servicesMenuKeyboard);
+        await showScreen(chatId, "یکی از خدمات زیر رو انتخاب کنید:", servicesMenuKeyboard, cq);
       } else if (data === "menu_account") {
         const user = getUser(chatId);
         let text = `👤 حساب کاربری شما\n\nموجودی فعلی: ${user.balance.toLocaleString("fa-IR")} تومان\n\n`;
@@ -200,23 +256,24 @@ app.post("/telegram-webhook", async (req, res) => {
             text += `• ${desc} — ${o.amount.toLocaleString("fa-IR")} تومان — ${o.status}\n`;
           });
         }
-        await sendMessage(chatId, text, mainMenuKeyboard);
+        await showScreen(chatId, text, mainMenuKeyboard, cq);
       } else if (data === "svc_stars") {
-        await sendMessage(chatId, "⭐ Stars", productKeyboard(STARS));
+        await showScreen(chatId, "⭐ Stars", productKeyboard(STARS), cq);
       } else if (data === "svc_premium") {
-        await sendMessage(
+        await showScreen(
           chatId,
           "❗دقت کنید تمام سفارشات تلگرام نیازی به ورود به اکانت نیست و به صورت گیفت برای شما فرستاده میشه.",
-          productKeyboard(PREMIUM)
+          productKeyboard(PREMIUM),
+          cq
         );
       } else if (data === "svc_gift") {
-        await sendMessage(chatId, "🎁 گیفت تلگرام", productKeyboard(GIFTS));
+        await showScreen(chatId, "🎁 گیفت تلگرام", productKeyboard(GIFTS), cq);
       } else if (data === "svc_number") {
-        await sendMessage(chatId, "🛒 برای خرید و استعلام قیمت شماره مجازی به آیدی @Its_Cavallo پیام بدهید ♥️", servicesMenuKeyboard);
+        await showScreen(chatId, "🛒 برای خرید و استعلام قیمت شماره مجازی به آیدی @Its_Cavallo پیام بدهید ♥️", servicesMenuKeyboard, cq);
       } else if (data.startsWith("buy_")) {
         const code = data.replace("buy_", "");
         const product = findProduct(code);
-        if (product) await handlePurchase(chatId, product);
+        if (product) await handlePurchase(chatId, product, cq);
       } else if (data.startsWith("approve_") || data.startsWith("reject_")) {
         // admin-only actions (for balance top-up approvals)
         if (String(cq.from.id) !== String(ADMIN_CHAT_ID)) return res.sendStatus(200);
@@ -248,13 +305,15 @@ app.post("/telegram-webhook", async (req, res) => {
 
       if (msg.text === "/start") {
         delete state[chatId];
+        delete lastScreenMessageId[chatId];
         await sendMessage(chatId, "سلام 👋 خوش اومدید!", persistentKeyboard);
-        await sendMessage(chatId, "یکی از گزینه‌های زیر رو انتخاب کنید:", mainMenuKeyboard);
+        const sent = await sendMessage(chatId, "یکی از گزینه‌های زیر رو انتخاب کنید:", mainMenuKeyboard);
+        if (sent.ok) lastScreenMessageId[chatId] = sent.result.message_id;
         return res.sendStatus(200);
       }
 
       if (msg.text === "🏠 Menu") {
-        await showMainMenu(chatId);
+        await showMainMenu(chatId, null);
         return res.sendStatus(200);
       }
 
@@ -262,9 +321,11 @@ app.post("/telegram-webhook", async (req, res) => {
       if (pending && pending.step === "awaiting_amount" && msg.text) {
         pending.order.amount = msg.text.trim();
         pending.step = "awaiting_receipt";
-        await sendMessage(
+        await showScreen(
           chatId,
-          `💳 ${CARD_NUMBER}\n${CARD_HOLDER}\n\nرسید واریز رو ارسال کنید و منتظر تایید باشید.\nتشکر از صبر و شکیبایی شما ♥️✨`
+          `💳 ${CARD_NUMBER}\n${CARD_HOLDER}\n\nرسید واریز رو ارسال کنید و منتظر تایید باشید.\nتشکر از صبر و شکیبایی شما ♥️✨`,
+          undefined,
+          null
         );
         return res.sendStatus(200);
       }
@@ -280,7 +341,7 @@ app.post("/telegram-webhook", async (req, res) => {
       }
 
       // Fallback: show main menu for any other message
-      await sendMessage(chatId, "برای شروع، یکی از گزینه‌ها رو انتخاب کنید:", mainMenuKeyboard);
+      await showMainMenu(chatId, null);
     }
 
     res.sendStatus(200);
