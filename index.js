@@ -7,8 +7,8 @@ const { STARS, PREMIUM, GIFTS, findProduct } = require("./catalog");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID; // your own Telegram chat id, to receive receipts
-const CARD_NUMBER = process.env.CARD_NUMBER || "6219861406755743";
-const CARD_HOLDER = process.env.CARD_HOLDER || "حمید کریمی";
+const CARD_NUMBER = process.env.CARD_NUMBER || "6219861810275312";
+const CARD_HOLDER = process.env.CARD_HOLDER || "محمد مرادجوی";
 const PORT = process.env.PORT || 3000;
 
 const API = `https://api.telegram.org/bot${BOT_TOKEN}`;
@@ -163,6 +163,11 @@ function insufficientBalanceKeyboard() {
 
 // ---------- Order flow helpers ----------
 
+const recipientKeyboard = inlineKb([
+  [{ text: "🙋‍♂️ برای خودم", callback_data: "recipient_self" }],
+  [{ text: "👤 برای شخص دیگه", callback_data: "recipient_other" }]
+]);
+
 async function handlePurchase(chatId, product, cq) {
   const user = getUser(chatId);
   if (user.balance < product.price) {
@@ -175,21 +180,30 @@ async function handlePurchase(chatId, product, cq) {
     return;
   }
 
+  // Deduct balance now, then ask who the order is for before finalizing.
   addBalance(chatId, -product.price);
+  state[chatId] = { step: "awaiting_recipient_choice", pendingPurchase: { product } };
+
+  await showScreen(chatId, "این سفارش برای چه کسی هست؟", recipientKeyboard, cq);
+}
+
+async function finalizePurchaseOrder(chatId, product, recipientLabel, cq) {
   const order = addOrder(chatId, {
     type: "purchase",
     description: product.desc,
     amount: product.price,
-    status: "در حال انجام"
+    status: "در حال انجام",
+    recipient: recipientLabel
   });
 
   await showScreen(chatId, "✅ درخواست شما ثبت شد و خریدتون در اسرع وقت انجام میشه ♥️", mainMenuKeyboard, cq);
   await forwardToAdmin(
     chatId,
-    `🛒 خرید جدید (از موجودی): ${product.desc} — ${product.price.toLocaleString("fa-IR")} تومان\nشناسه سفارش: ${order.id}`,
+    `🛒 خرید جدید (از موجودی): ${product.desc} — ${product.price.toLocaleString("fa-IR")} تومان\nبرای: ${recipientLabel}\nشناسه سفارش: ${order.id}`,
     order.id,
     false
   );
+  delete state[chatId];
 }
 
 async function finalizeTopup(chatId, receiptText, receiptFileId) {
@@ -253,7 +267,8 @@ app.post("/telegram-webhook", async (req, res) => {
           text += "آخرین سفارش‌ها:\n";
           user.orders.slice(0, 5).forEach((o) => {
             const desc = o.type === "topup" ? "افزایش موجودی" : o.description;
-            text += `• ${desc} — ${o.amount.toLocaleString("fa-IR")} تومان — ${o.status}\n`;
+            const recipientPart = o.recipient ? ` (برای: ${o.recipient})` : "";
+            text += `• ${desc}${recipientPart} — ${o.amount.toLocaleString("fa-IR")} تومان — ${o.status}\n`;
           });
         }
         await showScreen(chatId, text, mainMenuKeyboard, cq);
@@ -274,6 +289,21 @@ app.post("/telegram-webhook", async (req, res) => {
         const code = data.replace("buy_", "");
         const product = findProduct(code);
         if (product) await handlePurchase(chatId, product, cq);
+      } else if (data === "recipient_self") {
+        const pending = state[chatId];
+        if (pending && pending.pendingPurchase) {
+          const fromUser = cq.from;
+          const recipientLabel = fromUser.username
+            ? `@${fromUser.username} (id: ${fromUser.id})`
+            : `id: ${fromUser.id}${fromUser.first_name ? " - " + fromUser.first_name : ""}`;
+          await finalizePurchaseOrder(chatId, pending.pendingPurchase.product, recipientLabel, cq);
+        }
+      } else if (data === "recipient_other") {
+        const pending = state[chatId];
+        if (pending && pending.pendingPurchase) {
+          state[chatId] = { step: "awaiting_recipient_id", pendingPurchase: pending.pendingPurchase };
+          await showScreen(chatId, "لطفاً آیدی تلگرام شخصی که سفارش براش هست رو ارسال کنید (مثلاً @username):", undefined, cq);
+        }
       } else if (data.startsWith("approve_") || data.startsWith("reject_")) {
         // admin-only actions (for balance top-up approvals)
         if (String(cq.from.id) !== String(ADMIN_CHAT_ID)) return res.sendStatus(200);
@@ -318,6 +348,11 @@ app.post("/telegram-webhook", async (req, res) => {
       }
 
       const pending = state[chatId];
+      if (pending && pending.step === "awaiting_recipient_id" && msg.text) {
+        await finalizePurchaseOrder(chatId, pending.pendingPurchase.product, msg.text.trim(), null);
+        return res.sendStatus(200);
+      }
+
       if (pending && pending.step === "awaiting_amount" && msg.text) {
         pending.order.amount = msg.text.trim();
         pending.step = "awaiting_receipt";
