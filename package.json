@@ -1,0 +1,15 @@
+{
+  "name": "telegram-store-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot with button menu for stars, premium, gifts, and balance top-up with admin approval",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
