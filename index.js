@@ -7,8 +7,8 @@ const { STARS, PREMIUM, GIFTS, findProduct } = require("./catalog");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID; // your own Telegram chat id, to receive receipts
-const CARD_NUMBER = process.env.CARD_NUMBER || "6219861810275312";
-const CARD_HOLDER = process.env.CARD_HOLDER || "محمد مرادجوی";
+const CARD_NUMBER = process.env.CARD_NUMBER || "6219861406755743";
+const CARD_HOLDER = process.env.CARD_HOLDER || "حمید کریمی";
 const PORT = process.env.PORT || 3000;
 
 const API = `https://api.telegram.org/bot${BOT_TOKEN}`;
